@@ -99,7 +99,7 @@ jobs:
             WantedBy=multi-user.target
             EOF
 
-            # remove any appleboy wrapper lines and leading blanks anywhere
+            # remove any wrapper lines (e.g., DRONE_* injected) and leading blanks
             awk 'BEGIN{seen=0} !/^DRONE_/ { if(!seen){ if($0 ~ /^[[:space:]]*$/){ next } else { seen=1 } } print }' "$SERVICE_FILE_TMP" > "${SERVICE_FILE_TMP}.clean"
             install -m 0644 "${SERVICE_FILE_TMP}.clean" /etc/systemd/system/naic.service
             rm -f "$SERVICE_FILE_TMP" "${SERVICE_FILE_TMP}.clean"
@@ -109,12 +109,12 @@ jobs:
             systemctl restart naic
 
             # -------------------------
-            # Nginx site (HTTP first) – same sanitize
+            # Nginx site (HTTP first) – write, sanitize, install
             # -------------------------
             NGINX_SITE_TMP="$(mktemp)"
             cat > "$NGINX_SITE_TMP" <<'EOF'
             server {
-                listen 80;
+                listen 80 default_server;
                 server_name _;
 
                 access_log /var/log/nginx/naic_access.log;
@@ -137,8 +137,9 @@ jobs:
             install -m 0644 "${NGINX_SITE_TMP}.clean" "$NGINX_SITE"
             rm -f "$NGINX_SITE_TMP" "${NGINX_SITE_TMP}.clean"
 
-            # ensure a clean symlink (remove any old file that might contain junk)
-            rm -f /etc/nginx/sites-enabled/naic
+            # ensure only our site is enabled and is the default
+            rm -f /etc/nginx/sites-enabled/default || true
+            rm -f /etc/nginx/sites-enabled/naic || true
             ln -s "$NGINX_SITE" /etc/nginx/sites-enabled/naic
 
             nginx -t
