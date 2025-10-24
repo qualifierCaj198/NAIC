@@ -78,32 +78,31 @@ jobs:
             pip install gunicorn
 
             # -------------------------
-            # systemd service
+            # systemd service (heredoc INDENTED under script block)
             # -------------------------
             SERVICE_FILE_TMP="$(mktemp)"
-cat > "$SERVICE_FILE_TMP" <<'EOF'
-[Unit]
-Description=NAIC Flask app (gunicorn)
-After=network.target
+            cat > "$SERVICE_FILE_TMP" <<'EOF'
+            [Unit]
+            Description=NAIC Flask app (gunicorn)
+            After=network.target
 
-[Service]
-User=root
-Group=root
-WorkingDirectory=/opt/naic/app
-Environment=PATH=/opt/naic/app/.venv/bin
-ExecStart=/opt/naic/app/.venv/bin/gunicorn -w 3 -b 127.0.0.1:8000 app:app
-Restart=always
-RestartSec=3
+            [Service]
+            User=root
+            Group=root
+            WorkingDirectory=/opt/naic/app
+            Environment=PATH=/opt/naic/app/.venv/bin
+            ExecStart=/opt/naic/app/.venv/bin/gunicorn -w 3 -b 127.0.0.1:8000 app:app
+            Restart=always
+            RestartSec=3
 
-[Install]
-WantedBy=multi-user.target
-EOF
+            [Install]
+            WantedBy=multi-user.target
+            EOF
 
-            # sanitize possible injected first-line from the ssh wrapper
+            # sanitize possible first-line injected by ssh wrapper
             if head -n1 "$SERVICE_FILE_TMP" | grep -q '^DRONE_SSH_PREV_COMMAND_EXIT_CODE'; then
               tail -n +2 "$SERVICE_FILE_TMP" > "${SERVICE_FILE_TMP}.clean" && mv "${SERVICE_FILE_TMP}.clean" "$SERVICE_FILE_TMP"
             fi
-
             install -m 0644 "$SERVICE_FILE_TMP" /etc/systemd/system/naic.service
             rm -f "$SERVICE_FILE_TMP"
 
@@ -115,25 +114,25 @@ EOF
             # Nginx site (HTTP first)
             # -------------------------
             NGINX_SITE_TMP="$(mktemp)"
-cat > "$NGINX_SITE_TMP" <<'EOF'
-server {
-    listen 80;
-    server_name _;
+            cat > "$NGINX_SITE_TMP" <<'EOF'
+            server {
+                listen 80;
+                server_name _;
 
-    access_log /var/log/nginx/naic_access.log;
-    error_log  /var/log/nginx/naic_error.log;
+                access_log /var/log/nginx/naic_access.log;
+                error_log  /var/log/nginx/naic_error.log;
 
-    location / {
-        proxy_pass         http://127.0.0.1:8000;
-        proxy_set_header   Host $host;
-        proxy_set_header   X-Real-IP $remote_addr;
-        proxy_set_header   X-Forwarded-For $proxy_add_x_forwarded_for;
-        proxy_set_header   X-Forwarded-Proto $scheme;
-    }
-}
-EOF
+                location / {
+                    proxy_pass         http://127.0.0.1:8000;
+                    proxy_set_header   Host $host;
+                    proxy_set_header   X-Real-IP $remote_addr;
+                    proxy_set_header   X-Forwarded-For $proxy_add_x_forwarded_for;
+                    proxy_set_header   X-Forwarded-Proto $scheme;
+                }
+            }
+            EOF
 
-            # sanitize possible injected first-line from the ssh wrapper
+            # sanitize possible first-line injected by ssh wrapper
             if head -n1 "$NGINX_SITE_TMP" | grep -q '^DRONE_SSH_PREV_COMMAND_EXIT_CODE'; then
               tail -n +2 "$NGINX_SITE_TMP" > "${NGINX_SITE_TMP}.clean" && mv "${NGINX_SITE_TMP}.clean" "$NGINX_SITE_TMP"
             fi
