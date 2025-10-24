@@ -30,24 +30,32 @@ jobs:
 
       - name: Remote deploy & HTTPS setup
         uses: appleboy/ssh-action@v1.2.0
+        env:
+          # pass values from secrets (these may be empty if you didn't create them)
+          APP_DIR: ${{ secrets.APP_DIR }}
+          SERVER_NAME: ${{ secrets.SERVER_NAME }}
+          LETSENCRYPT_EMAIL: ${{ secrets.LETSENCRYPT_EMAIL }}
         with:
           host: ${{ secrets.SSH_HOST }}
           username: ${{ secrets.SSH_USER }}
           password: ${{ secrets.SSH_PASSWORD }}
           script_stop: true
+          # tell the action which env vars to forward into the remote session
           envs: GITHUB_SHA,APP_DIR,SERVER_NAME,LETSENCRYPT_EMAIL
           script: |
             set -euo pipefail
             GITHUB_SHA="${{ github.sha }}"
-            APP_DIR="${{ secrets.APP_DIR }}"
-            SERVER_NAME="${{ secrets.SERVER_NAME:-_ }}"
-            LETSENCRYPT_EMAIL="${{ secrets.LETSENCRYPT_EMAIL:-admin@example.com }}"
+
+            # fallbacks for optional vars
+            APP_DIR="${APP_DIR:-/opt/naic}"
+            SERVER_NAME="${SERVER_NAME:-_}"
+            LETSENCRYPT_EMAIL="${LETSENCRYPT_EMAIL:-admin@example.com}"
 
             # Base packages
             apt-get update
             DEBIAN_FRONTEND=noninteractive apt-get install -y python3 python3-venv python3-pip nginx git ufw certbot python3-certbot-nginx
 
-            # UFW rules (allow HTTP/HTTPS/SSH)
+            # UFW rules
             ufw allow OpenSSH || true
             ufw allow 'Nginx Full' || true
             ufw --force enable || true
@@ -123,7 +131,7 @@ jobs:
             systemctl reload nginx
 
             # If a real domain is supplied, obtain cert and enable HTTPS + redirect
-            if [ "$SERVER_NAME" != "_" ] && [ "$SERVER_NAME" != "localhost" ]; then
+            if [ "$SERVER_NAME" != "_" ] && [ "$SERVER_NAME" != "localhost" ] && [ -n "$SERVER_NAME" ]; then
               sed -i "s/server_name _;/server_name ${SERVER_NAME};/" "$NGINX_SITE"
               nginx -t && systemctl reload nginx
               certbot --nginx -d "$SERVER_NAME" --non-interactive --agree-tos -m "$LETSENCRYPT_EMAIL" --redirect || true
