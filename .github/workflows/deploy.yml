@@ -40,15 +40,13 @@ jobs:
           script: |
             set -euo pipefail
             GITHUB_SHA="${{ github.sha }}"
-
-            # fallbacks for optional vars
             APP_DIR="${APP_DIR:-/opt/naic}"
             SERVER_NAME="${SERVER_NAME:-_}"
             LETSENCRYPT_EMAIL="${LETSENCRYPT_EMAIL:-admin@example.com}"
 
             # Base packages
             apt-get update
-            DEBIAN_FRONTEND=noninteractive apt-get install -y python3 python3-venv python3-pip nginx git ufw certbot python3-certbot-nginx
+            DEBIAN_FRONTEND=noninteractive apt-get install -y python3 python3-venv python3-pip nginx git ufw certbot python3-certbot-nginx curl procps
 
             # UFW rules
             ufw allow OpenSSH || true
@@ -90,8 +88,19 @@ jobs:
             User=root
             Group=root
             WorkingDirectory=/opt/naic/app
+            Environment=PYTHONUNBUFFERED=1
+            Environment=PYTHONPATH=/opt/naic/app
             Environment=PATH=/opt/naic/app/.venv/bin
-            ExecStart=/opt/naic/app/.venv/bin/gunicorn -w 3 -b 127.0.0.1:8000 app:app
+            ExecStart=/opt/naic/app/.venv/bin/gunicorn \
+              --workers 3 \
+              --worker-class gthread \
+              --threads 8 \
+              --bind 127.0.0.1:8000 \
+              --timeout 120 \
+              --graceful-timeout 30 \
+              --access-logfile - \
+              --error-logfile - \
+              app:app
             Restart=always
             RestartSec=3
 
@@ -99,7 +108,7 @@ jobs:
             WantedBy=multi-user.target
             EOF
 
-            # remove any wrapper lines (e.g., DRONE_* injected) and leading blanks
+            # strip any injected DRONE_* lines + leading blanks
             awk 'BEGIN{seen=0} !/^DRONE_/ { if(!seen){ if($0 ~ /^[[:space:]]*$/){ next } else { seen=1 } } print }' "$SERVICE_FILE_TMP" > "${SERVICE_FILE_TMP}.clean"
             install -m 0644 "${SERVICE_FILE_TMP}.clean" /etc/systemd/system/naic.service
             rm -f "$SERVICE_FILE_TMP" "${SERVICE_FILE_TMP}.clean"
@@ -108,8 +117,19 @@ jobs:
             systemctl enable naic
             systemctl restart naic
 
+            # Quick backend checks before nginx
+            sleep 2
+            echo "== systemctl status naic =="
+            systemctl --no-pager --full status naic || true
+            echo "== last 200 lines of journal for naic =="
+            journalctl -u naic --no-pager -n 200 || true
+            echo "== listening on 8000? =="
+            ss -lntp | grep ':8000' || true
+            echo "== curl backend HEAD =="
+            curl -sS -D - -o /dev/null http://127.0.0.1:8000/ || true
+
             # -------------------------
-            # Nginx site (HTTP first) – write, sanitize, install
+            # Nginx site (HTTP first)
             # -------------------------
             NGINX_SITE_TMP="$(mktemp)"
             cat > "$NGINX_SITE_TMP" <<'EOF'
@@ -130,9 +150,7 @@ jobs:
             }
             EOF
 
-            # remove wrapper lines anywhere + leading blanks
             awk 'BEGIN{seen=0} !/^DRONE_/ { if(!seen){ if($0 ~ /^[[:space:]]*$/){ next } else { seen=1 } } print }' "$NGINX_SITE_TMP" > "${NGINX_SITE_TMP}.clean"
-
             NGINX_SITE="/etc/nginx/sites-available/naic"
             install -m 0644 "${NGINX_SITE_TMP}.clean" "$NGINX_SITE"
             rm -f "$NGINX_SITE_TMP" "${NGINX_SITE_TMP}.clean"
@@ -153,4 +171,7 @@ jobs:
               nginx -t && systemctl reload nginx
             fi
 
-            systemctl --no-pager status naic | sed -n '1,30p'
+            echo "== final systemctl status =="
+            systemctl --no-pager --full status naic || true
+            echo "== final nginx test =="
+            nginx -t || true
