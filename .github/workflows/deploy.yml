@@ -75,60 +75,53 @@ jobs:
             pip install -r requirements.txt
             pip install gunicorn
 
-            # --- Write wsgi.py to temp, sanitize DRONE_* lines, then DE-DENT and save ---
-            WSGI_TMP="$(mktemp)"
-            cat > "$WSGI_TMP" <<'PYRAW'
-            import importlib
+            # --- Write wsgi.py WITHOUT heredocs (avoid stdin injection) ---
+            python3 -c 'from textwrap import dedent
+code = dedent("""\
+import importlib
 
-            candidates = [
-                ("app", "app"), ("app", "application"),
-                ("wsgi", "app"), ("wsgi", "application"),
-                ("server", "app"), ("server", "application"),
-                ("main", "app"), ("main", "application"),
-            ]
+candidates = [
+    ("app", "app"), ("app", "application"),
+    ("wsgi", "app"), ("wsgi", "application"),
+    ("server", "app"), ("server", "application"),
+    ("main", "app"), ("main", "application"),
+]
 
-            application = None
+application = None
 
-            # Try common module:attribute pairs
-            for mod, attr in candidates:
-                try:
-                    m = importlib.import_module(mod)
-                    if hasattr(m, attr):
-                        application = getattr(m, attr)
-                        break
-                except Exception:
-                    continue
+# Try common module:attribute pairs
+for mod, attr in candidates:
+    try:
+        m = importlib.import_module(mod)
+        if hasattr(m, attr):
+            application = getattr(m, attr)
+            break
+    except Exception:
+        continue
 
-            # Try app factory pattern
-            if application is None:
-                for mod in ["app", "server", "main", "wsgi"]:
-                    try:
-                        m = importlib.import_module(mod)
-                        if hasattr(m, "create_app"):
-                            application = m.create_app()
-                            break
-                    except Exception:
-                        continue
+# Try app factory pattern
+if application is None:
+    for mod in ["app", "server", "main", "wsgi"]:
+        try:
+            m = importlib.import_module(mod)
+            if hasattr(m, "create_app"):
+                application = m.create_app()
+                break
+        except Exception:
+            continue
 
-            if application is None:
-                raise RuntimeError(
-                    "Could not locate Flask app. "
-                    "Define 'app' or 'application' in app.py/server.py/main.py, "
-                    "or provide a create_app()"
-                )
-            PYRAW
+if application is None:
+    raise RuntimeError(
+        "Could not locate Flask app. "
+        "Define \\"app\\" or \\"application\\" in app.py/server.py/main.py, "
+        "or provide a create_app()"
+    )
+""").lstrip()
+open("wsgi.py","w",encoding="utf-8").write(code)'
 
-            # Remove any injected DRONE_* lines and leading blanks from the temp content,
-            # then de-dent the remaining Python so top-level starts at column 0.
-            awk 'BEGIN{seen=0} !/^DRONE_/ { if(!seen){ if($0 ~ /^[[:space:]]*$/){ next } else { seen=1 } } print }' "$WSGI_TMP" > "${WSGI_TMP}.clean" || true
-            python3 - "$WSGI_TMP.clean" <<'PY'
-            import sys, pathlib
-            from textwrap import dedent
-            src = pathlib.Path(sys.argv[1]).read_text(encoding="utf-8")
-            pathlib.Path("wsgi.py").write_text(dedent(src).lstrip(), encoding="utf-8")
-            PY
+            # If the wrapper still injected a line as the first line of the file, drop it
+            sed -i '1{/^DRONE_/d}' wsgi.py
             chmod 0644 wsgi.py
-            rm -f "$WSGI_TMP" "${WSGI_TMP}.clean"
 
             # -------------------------
             # systemd service (sanitize then install)
@@ -163,7 +156,6 @@ jobs:
             [Install]
             WantedBy=multi-user.target
             EOF
-
             awk 'BEGIN{seen=0} !/^DRONE_/ { if(!seen){ if($0 ~ /^[[:space:]]*$/){ next } else { seen=1 } } print }' "$SERVICE_FILE_TMP" > "${SERVICE_FILE_TMP}.clean"
             install -m 0644 "${SERVICE_FILE_TMP}.clean" /etc/systemd/system/naic.service
             rm -f "$SERVICE_FILE_TMP" "${SERVICE_FILE_TMP}.clean"
@@ -199,7 +191,6 @@ jobs:
                 }
             }
             EOF
-
             awk 'BEGIN{seen=0} !/^DRONE_/ { if(!seen){ if($0 ~ /^[[:space:]]*$/){ next } else { seen=1 } } print }' "$NGINX_SITE_TMP" > "${NGINX_SITE_TMP}.clean"
             NGINX_SITE="/etc/nginx/sites-available/naic"
             install -m 0644 "${NGINX_SITE_TMP}.clean" "$NGINX_SITE"
