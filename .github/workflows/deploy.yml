@@ -12,12 +12,10 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      # Build a tar.gz from the committed tree at HEAD (no live-file races)
       - name: Create deploy archive
         run: |
-          tar --exclude='.git' \
-              --exclude='.github' \
-              --exclude='.venv' \
-              -czf naic_${{ github.sha }}.tar.gz .
+          git archive --format=tar.gz -o naic_${{ github.sha }}.tar.gz HEAD
 
       - name: Upload archive to server
         uses: appleboy/scp-action@v0.1.7
@@ -31,7 +29,7 @@ jobs:
       - name: Remote deploy & HTTPS setup
         uses: appleboy/ssh-action@v1.2.0
         env:
-          # pass values from secrets (these may be empty if you didn't create them)
+          # optional; can be empty to stay HTTP-only
           APP_DIR: ${{ secrets.APP_DIR }}
           SERVER_NAME: ${{ secrets.SERVER_NAME }}
           LETSENCRYPT_EMAIL: ${{ secrets.LETSENCRYPT_EMAIL }}
@@ -40,7 +38,6 @@ jobs:
           username: ${{ secrets.SSH_USER }}
           password: ${{ secrets.SSH_PASSWORD }}
           script_stop: true
-          # tell the action which env vars to forward into the remote session
           envs: GITHUB_SHA,APP_DIR,SERVER_NAME,LETSENCRYPT_EMAIL
           script: |
             set -euo pipefail
