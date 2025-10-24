@@ -1,0 +1,130 @@
+name: Deploy to Vultr with HTTPS (password SSH)
+
+on:
+  push:
+    branches: [ "main" ]
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Create deploy archive
+        run: |
+          tar --exclude='.git'               --exclude='.github'               --exclude='.venv'               -czf naic_${{ github.sha }}.tar.gz .
+
+      - name: Upload archive to server
+        uses: appleboy/scp-action@v0.1.7
+        with:
+          host: ${{ secrets.SSH_HOST }}
+          username: ${{ secrets.SSH_USER }}
+          password: ${{ secrets.SSH_PASSWORD }}
+          source: "naic_${{ github.sha }}.tar.gz"
+          target: "${{ secrets.APP_DIR }}/releases/"
+
+      - name: Remote deploy & HTTPS setup
+        uses: appleboy/ssh-action@v1.2.0
+        with:
+          host: ${{ secrets.SSH_HOST }}
+          username: ${{ secrets.SSH_USER }}
+          password: ${{ secrets.SSH_PASSWORD }}
+          script_stop: true
+          envs: GITHUB_SHA,APP_DIR,SERVER_NAME,LETSENCRYPT_EMAIL
+          script: |
+            set -euo pipefail
+            GITHUB_SHA="${{ github.sha }}"
+            APP_DIR="${{ secrets.APP_DIR }}"
+            SERVER_NAME="${{ secrets.SERVER_NAME:-_ }}"
+            LETSENCRYPT_EMAIL="${{ secrets.LETSENCRYPT_EMAIL:-admin@example.com }}"
+
+            # Base packages
+            apt-get update
+            DEBIAN_FRONTEND=noninteractive apt-get install -y python3 python3-venv python3-pip nginx git ufw
+
+            # UFW rules (allow HTTP/HTTPS/SSH)
+            ufw allow OpenSSH || true
+            ufw allow 'Nginx Full' || true
+            ufw --force enable || true
+
+            mkdir -p "$APP_DIR/releases" "$APP_DIR/shared"
+            ARCHIVE="$APP_DIR/releases/naic_${GITHUB_SHA}.tar.gz"
+            if [ ! -f "$ARCHIVE" ]; then echo "Archive not found: $ARCHIVE"; exit 1; fi
+
+            # Unpack new release
+            rm -rf "$APP_DIR/app.new"
+            mkdir -p "$APP_DIR/app.new"
+            tar -xzf "$ARCHIVE" -C "$APP_DIR/app.new"
+
+            # Activate release
+            rm -rf "$APP_DIR/app.prev"
+            if [ -d "$APP_DIR/app" ]; then mv "$APP_DIR/app" "$APP_DIR/app.prev"; fi
+            mv "$APP_DIR/app.new" "$APP_DIR/app"
+
+            # Python venv + deps
+            cd "$APP_DIR/app"
+            if [ ! -d ".venv" ]; then python3 -m venv .venv; fi
+            . .venv/bin/activate
+            python -m pip install --upgrade pip setuptools wheel
+            pip install -r requirements.txt
+            pip install gunicorn
+
+            # systemd service
+            SERVICE_FILE="/etc/systemd/system/naic.service"
+            cat > "$SERVICE_FILE" <<'EOF'
+[Unit]
+Description=NAIC Flask app (gunicorn)
+After=network.target
+
+[Service]
+User=root
+Group=root
+WorkingDirectory=/opt/naic/app
+Environment=PATH=/opt/naic/app/.venv/bin
+ExecStart=/opt/naic/app/.venv/bin/gunicorn -w 3 -b 127.0.0.1:8000 app:app
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target
+EOF
+            systemctl daemon-reload
+            systemctl enable naic
+            systemctl restart naic
+
+            # Nginx site (HTTP first)
+            NGINX_SITE="/etc/nginx/sites-available/naic"
+            cat > "$NGINX_SITE" <<EOF
+server {
+    listen 80;
+    server_name ${SERVER_NAME};
+
+    access_log /var/log/nginx/naic_access.log;
+    error_log  /var/log/nginx/naic_error.log;
+
+    location / {
+        proxy_pass         http://127.0.0.1:8000;
+        proxy_set_header   Host \$host;
+        proxy_set_header   X-Real-IP \$remote_addr;
+        proxy_set_header   X-Forwarded-For \$proxy_add_x_forwarded_for;
+        proxy_set_header   X-Forwarded-Proto \$scheme;
+    }
+}
+EOF
+            ln -sf /etc/nginx/sites-available/naic /etc/nginx/sites-enabled/naic
+            nginx -t
+            systemctl reload nginx
+
+            # If a real domain is supplied, install certbot and obtain cert
+            if [ "$SERVER_NAME" != "_" ] && [ "$SERVER_NAME" != "localhost" ]; then
+              # Install certbot + nginx plugin
+              DEBIAN_FRONTEND=noninteractive apt-get install -y certbot python3-certbot-nginx
+              # Obtain/renew cert and auto-configure Nginx with HTTPS + redirect
+              certbot --nginx -d "$SERVER_NAME" --non-interactive --agree-tos -m "$LETSENCRYPT_EMAIL" --redirect || true
+              systemctl reload nginx || true
+            fi
+
+            # Show service status
+            systemctl --no-pager status naic | sed -n '1,30p'
