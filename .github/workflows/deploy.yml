@@ -77,57 +77,53 @@ jobs:
             pip install -r requirements.txt
             pip install gunicorn
 
-            # --- Write wsgi.py via heredoc, then sanitize & de-dent ---
+            # --- Write wsgi.py via literal heredoc (no indentation), then sanitize ---
             WSGI_TMP="$(mktemp)"
             cat > "$WSGI_TMP" <<'PYEOF'
-            import importlib
+import importlib
 
-            candidates = [
-                ("app", "app"), ("app", "application"),
-                ("wsgi", "app"), ("wsgi", "application"),
-                ("server", "app"), ("server", "application"),
-                ("main", "app"), ("main", "application"),
-            ]
+candidates = [
+    ("app", "app"), ("app", "application"),
+    ("wsgi", "app"), ("wsgi", "application"),
+    ("server", "app"), ("server", "application"),
+    ("main", "app"), ("main", "application"),
+]
 
-            application = None
+application = None
 
-            # Try common module:attribute pairs
-            for mod, attr in candidates:
-                try:
-                    m = importlib.import_module(mod)
-                    if hasattr(m, attr):
-                        application = getattr(m, attr)
-                        break
-                except Exception:
-                    continue
+# Try common module:attribute pairs
+for mod, attr in candidates:
+    try:
+        m = importlib.import_module(mod)
+        if hasattr(m, attr):
+            application = getattr(m, attr)
+            break
+    except Exception:
+        continue
 
-            # Try app factory pattern
-            if application is None:
-                for mod in ["app", "server", "main", "wsgi"]:
-                    try:
-                        m = importlib.import_module(mod)
-                        if hasattr(m, "create_app"):
-                            application = m.create_app()
-                            break
-                    except Exception:
-                        continue
+# Try app factory pattern
+if application is None:
+    for mod in ["app", "server", "main", "wsgi"]:
+        try:
+            m = importlib.import_module(mod)
+            if hasattr(m, "create_app"):
+                application = m.create_app()
+                break
+        except Exception:
+            continue
 
-            if application is None:
-                raise RuntimeError(
-                    "Could not locate Flask app. "
-                    "Define 'app' or 'application' in app.py/server.py/main.py, "
-                    "or provide a create_app()"
-                )
-            PYEOF
+if application is None:
+    raise RuntimeError(
+        "Could not locate Flask app. "
+        "Define 'app' or 'application' in app.py/server.py/main.py, "
+        "or provide a create_app()"
+    )
+PYEOF
 
             # Strip any injected DRONE_* lines and leading blank lines
-            awk 'BEGIN{seen=0} !/^DRONE_/ { if(!seen){ if($0 ~ /^[[:space:]]*$/){ next } else { seen=1 } } print }' "$WSGI_TMP" > "$WSGI_TMP.clean"
-
-            # De-dent the code so top-level starts at column 0
-            python3 -c 'import sys, pathlib, textwrap; p=pathlib.Path(sys.argv[1]); s=p.read_text(); pathlib.Path("wsgi.py").write_text(textwrap.dedent(s).lstrip(), encoding="utf-8")' "$WSGI_TMP.clean"
-
-            rm -f "$WSGI_TMP" "$WSGI_TMP.clean"
+            awk 'BEGIN{seen=0} !/^DRONE_/ { if(!seen){ if($0 ~ /^[[:space:]]*$/){ next } else { seen=1 } } print }' "$WSGI_TMP" > wsgi.py
             chmod 0644 wsgi.py
+            rm -f "$WSGI_TMP"
 
             # -------------------------
             # systemd service (sanitize then install)
