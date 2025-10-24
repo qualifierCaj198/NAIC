@@ -17,10 +17,13 @@ jobs:
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
+          lfs: false
 
-      - name: Create release archive
+      - name: Create release archive (git archive)
         run: |
-          tar -czf release.tar.gz --exclude='.git' --exclude='.github' .
+          set -euo pipefail
+          git archive --format=tar.gz -o release.tar.gz HEAD
+          ls -lh release.tar.gz
 
       - name: Upload archive to server
         uses: appleboy/scp-action@v0.1.7
@@ -62,7 +65,6 @@ jobs:
             # ---------- Python app (Flask/Django/FastAPI) ----------
             if [ -f requirements.txt ]; then
               echo "[deploy] Detected Python app"
-              # Ensure Python and venv
               sudo apt-get update -y
               sudo apt-get install -y python3-venv python3-pip
               python3 -m venv .venv || true
@@ -108,18 +110,15 @@ jobs:
             fi
 
             # ---------- Process restarts (best-effort) ----------
-            # If a systemd service exists, restart it.
             if [ -n "${SERVICE_NAME:-}" ]; then
               echo "[deploy] Restarting systemd service: $SERVICE_NAME"
               sudo systemctl restart "$SERVICE_NAME" || true
             elif systemctl list-units --type=service | grep -qE '(gunicorn|uvicorn|app\.service)'; then
-              # Try common names
               for svc in gunicorn uvicorn app; do
                 sudo systemctl restart "$svc" 2>/dev/null || true
               done
             fi
 
-            # PM2 if ecosystem file exists
             if [ -f ecosystem.config.js ] || [ -f ecosystem.config.cjs ] || [ -f ecosystem.config.mjs ]; then
               if ! command -v pm2 >/dev/null 2>&1; then
                 sudo npm i -g pm2
