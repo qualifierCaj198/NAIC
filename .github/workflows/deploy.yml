@@ -75,6 +75,48 @@ jobs:
             pip install -r requirements.txt
             pip install gunicorn
 
+            # --- Portable wsgi.py (finds your Flask app automatically) ---
+            cat > wsgi.py <<'PYEOF'
+            import importlib
+
+            candidates = [
+                ("app", "app"), ("app", "application"),
+                ("wsgi", "app"), ("wsgi", "application"),
+                ("server", "app"), ("server", "application"),
+                ("main", "app"), ("main", "application"),
+            ]
+
+            application = None
+
+            # Try common module:attribute pairs
+            for mod, attr in candidates:
+                try:
+                    m = importlib.import_module(mod)
+                    if hasattr(m, attr):
+                        application = getattr(m, attr)
+                        break
+                except Exception:
+                    continue
+
+            # Try app factory pattern
+            if application is None:
+                for mod in ["app", "server", "main", "wsgi"]:
+                    try:
+                        m = importlib.import_module(mod)
+                        if hasattr(m, "create_app"):
+                            application = m.create_app()
+                            break
+                    except Exception:
+                        continue
+
+            if application is None:
+                raise RuntimeError(
+                    "Could not locate Flask app. "
+                    "Define 'app' or 'application' in app.py/server.py/main.py, "
+                    "or provide a create_app()"
+                )
+            PYEOF
+
             # -------------------------
             # systemd service (write to tmp, sanitize, install)
             # -------------------------
@@ -82,7 +124,8 @@ jobs:
             cat > "$SERVICE_FILE_TMP" <<'EOF'
             [Unit]
             Description=NAIC Flask app (gunicorn)
-            After=network.target
+            After=network-online.target
+            Wants=network-online.target
 
             [Service]
             User=root
@@ -100,7 +143,7 @@ jobs:
               --graceful-timeout 30 \
               --access-logfile - \
               --error-logfile - \
-              app:app
+              wsgi:application
             Restart=always
             RestartSec=3
 
@@ -108,7 +151,7 @@ jobs:
             WantedBy=multi-user.target
             EOF
 
-            # strip any injected DRONE_* lines + leading blanks
+            # remove wrapper lines + leading blanks
             awk 'BEGIN{seen=0} !/^DRONE_/ { if(!seen){ if($0 ~ /^[[:space:]]*$/){ next } else { seen=1 } } print }' "$SERVICE_FILE_TMP" > "${SERVICE_FILE_TMP}.clean"
             install -m 0644 "${SERVICE_FILE_TMP}.clean" /etc/systemd/system/naic.service
             rm -f "$SERVICE_FILE_TMP" "${SERVICE_FILE_TMP}.clean"
@@ -125,8 +168,6 @@ jobs:
             journalctl -u naic --no-pager -n 200 || true
             echo "== listening on 8000? =="
             ss -lntp | grep ':8000' || true
-            echo "== curl backend HEAD =="
-            curl -sS -D - -o /dev/null http://127.0.0.1:8000/ || true
 
             # -------------------------
             # Nginx site (HTTP first)
@@ -173,5 +214,7 @@ jobs:
 
             echo "== final systemctl status =="
             systemctl --no-pager --full status naic || true
+            echo "== final curl backend =="
+            curl -sS -D - -o /dev/null http://127.0.0.1:8000/ || true
             echo "== final nginx test =="
             nginx -t || true
