@@ -78,7 +78,7 @@ jobs:
             pip install gunicorn
 
             # -------------------------
-            # systemd service (heredoc INDENTED under script block)
+            # systemd service (write to tmp, sanitize, install)
             # -------------------------
             SERVICE_FILE_TMP="$(mktemp)"
             cat > "$SERVICE_FILE_TMP" <<'EOF'
@@ -99,19 +99,17 @@ jobs:
             WantedBy=multi-user.target
             EOF
 
-            # sanitize possible first-line injected by ssh wrapper
-            if head -n1 "$SERVICE_FILE_TMP" | grep -q '^DRONE_SSH_PREV_COMMAND_EXIT_CODE'; then
-              tail -n +2 "$SERVICE_FILE_TMP" > "${SERVICE_FILE_TMP}.clean" && mv "${SERVICE_FILE_TMP}.clean" "$SERVICE_FILE_TMP"
-            fi
-            install -m 0644 "$SERVICE_FILE_TMP" /etc/systemd/system/naic.service
-            rm -f "$SERVICE_FILE_TMP"
+            # remove any appleboy wrapper lines and leading blanks anywhere
+            awk 'BEGIN{seen=0} !/^DRONE_/ { if(!seen){ if($0 ~ /^[[:space:]]*$/){ next } else { seen=1 } } print }' "$SERVICE_FILE_TMP" > "${SERVICE_FILE_TMP}.clean"
+            install -m 0644 "${SERVICE_FILE_TMP}.clean" /etc/systemd/system/naic.service
+            rm -f "$SERVICE_FILE_TMP" "${SERVICE_FILE_TMP}.clean"
 
             systemctl daemon-reload
             systemctl enable naic
             systemctl restart naic
 
             # -------------------------
-            # Nginx site (HTTP first)
+            # Nginx site (HTTP first) – same sanitize
             # -------------------------
             NGINX_SITE_TMP="$(mktemp)"
             cat > "$NGINX_SITE_TMP" <<'EOF'
@@ -132,16 +130,17 @@ jobs:
             }
             EOF
 
-            # sanitize possible first-line injected by ssh wrapper
-            if head -n1 "$NGINX_SITE_TMP" | grep -q '^DRONE_SSH_PREV_COMMAND_EXIT_CODE'; then
-              tail -n +2 "$NGINX_SITE_TMP" > "${NGINX_SITE_TMP}.clean" && mv "${NGINX_SITE_TMP}.clean" "$NGINX_SITE_TMP"
-            fi
+            # remove wrapper lines anywhere + leading blanks
+            awk 'BEGIN{seen=0} !/^DRONE_/ { if(!seen){ if($0 ~ /^[[:space:]]*$/){ next } else { seen=1 } } print }' "$NGINX_SITE_TMP" > "${NGINX_SITE_TMP}.clean"
 
             NGINX_SITE="/etc/nginx/sites-available/naic"
-            install -m 0644 "$NGINX_SITE_TMP" "$NGINX_SITE"
-            rm -f "$NGINX_SITE_TMP"
+            install -m 0644 "${NGINX_SITE_TMP}.clean" "$NGINX_SITE"
+            rm -f "$NGINX_SITE_TMP" "${NGINX_SITE_TMP}.clean"
 
-            ln -sf /etc/nginx/sites-available/naic /etc/nginx/sites-enabled/naic
+            # ensure a clean symlink (remove any old file that might contain junk)
+            rm -f /etc/nginx/sites-enabled/naic
+            ln -s "$NGINX_SITE" /etc/nginx/sites-enabled/naic
+
             nginx -t
             systemctl reload nginx
 
