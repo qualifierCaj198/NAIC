@@ -123,12 +123,18 @@ jobs:
             # Strip any injected DRONE_* lines and leading blanks
             awk 'BEGIN{seen=0} !/^DRONE_/ { if(!seen){ if($0 ~ /^[[:space:]]*$/){ next } else { seen=1 } } print }' "$WSGI_TMP" > "$WSGI_TMP.clean"
 
-            # DE-DENT to remove YAML indentation
-            python3 - "$WSGI_TMP.clean" <<'PY'
+            # DE-DENT to remove YAML indentation — write helper file, then run it (avoid stdin injection)
+            DEDENTER="/tmp/dedent_wsgi.py"
+            cat > "$DEDENTER" <<'PY'
             import sys, pathlib, textwrap
-            src = pathlib.Path(sys.argv[1]).read_text(encoding="utf-8")
-            pathlib.Path("wsgi.py").write_text(textwrap.dedent(src).lstrip(), encoding="utf-8")
+            src_path = pathlib.Path(sys.argv[1])
+            dst_path = pathlib.Path("wsgi.py")
+            src = src_path.read_text(encoding="utf-8")
+            dst_path.write_text(textwrap.dedent(src).lstrip(), encoding="utf-8")
             PY
+            python3 "$DEDENTER" "$WSGI_TMP.clean"
+            rm -f "$DEDENTER"
+
             chmod 0644 wsgi.py
             rm -f "$WSGI_TMP" "$WSGI_TMP.clean"
 
