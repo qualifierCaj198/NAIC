@@ -1,20 +1,26 @@
-name: Deploy to Vultr with HTTPS (password SSH)
+name: Deploy to Vultr
 
 on:
   push:
-    branches: [ "main" ]
+    branches: [ main, master ]
+  workflow_dispatch:
+
+env:
+  APP_DIR: ${{ secrets.APP_DIR }}
 
 jobs:
   deploy:
     runs-on: ubuntu-latest
 
     steps:
-      - name: Checkout
+      - name: Checkout repository
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
-      - name: Create deploy archive (git archive avoids live-file races)
+      - name: Create release archive
         run: |
-          git archive --format=tar.gz -o naic_${{ github.sha }}.tar.gz HEAD
+          tar -czf release.tar.gz --exclude='.git' --exclude='.github' .
 
       - name: Upload archive to server
         uses: appleboy/scp-action@v0.1.7
@@ -22,214 +28,104 @@ jobs:
           host: ${{ secrets.SSH_HOST }}
           username: ${{ secrets.SSH_USER }}
           password: ${{ secrets.SSH_PASSWORD }}
-          source: "naic_${{ github.sha }}.tar.gz"
-          target: "${{ secrets.APP_DIR }}/releases/"
+          port: 22
+          source: "release.tar.gz"
+          target: "/tmp"
+          overwrite: true
 
-      - name: Remote deploy & HTTPS setup
+      - name: Deploy on server
         uses: appleboy/ssh-action@v1.2.0
-        env:
-          APP_DIR: ${{ secrets.APP_DIR }}
-          SERVER_NAME: ${{ secrets.SERVER_NAME }}
-          LETSENCRYPT_EMAIL: ${{ secrets.LETSENCRYPT_EMAIL }}
         with:
           host: ${{ secrets.SSH_HOST }}
           username: ${{ secrets.SSH_USER }}
           password: ${{ secrets.SSH_PASSWORD }}
+          port: 22
           script_stop: true
-          envs: GITHUB_SHA,APP_DIR,SERVER_NAME,LETSENCRYPT_EMAIL
           script: |
             set -euo pipefail
-            GITHUB_SHA="${{ github.sha }}"
-            APP_DIR="${APP_DIR:-/opt/naic}"
-            SERVER_NAME="${SERVER_NAME:-_}"
-            LETSENCRYPT_EMAIL="${LETSENCRYPT_EMAIL:-admin@example.com}"
+            APP_DIR="${{ secrets.APP_DIR }}"
+            RELEASE="/tmp/release.tar.gz"
 
-            # Base packages
-            apt-get update
-            DEBIAN_FRONTEND=noninteractive apt-get install -y \
-              python3 python3-venv python3-pip nginx git ufw certbot python3-certbot-nginx \
-              curl procps
-
-            # Firewall
-            ufw allow OpenSSH || true
-            ufw allow 'Nginx Full' || true
-            ufw --force enable || true
-
-            mkdir -p "$APP_DIR/releases" "$APP_DIR/shared"
-            ARCHIVE="$APP_DIR/releases/naic_${GITHUB_SHA}.tar.gz"
-            if [ ! -f "$ARCHIVE" ]; then echo "Archive not found: $ARCHIVE"; exit 1; fi
-
-            # Unpack new release
-            rm -rf "$APP_DIR/app.new"
-            mkdir -p "$APP_DIR/app.new"
-            tar -xzf "$ARCHIVE" -C "$APP_DIR/app.new"
-
-            # Activate release
-            rm -rf "$APP_DIR/app.prev"
-            if [ -d "$APP_DIR/app" ]; then mv "$APP_DIR/app" "$APP_DIR/app.prev"; fi
-            mv "$APP_DIR/app.new" "$APP_DIR/app"
-
-            # Python venv + deps
-            cd "$APP_DIR/app"
-            if [ ! -d ".venv" ]; then python3 -m venv .venv; fi
-            . .venv/bin/activate
-            python -m pip install --upgrade pip setuptools wheel
-            pip install -r requirements.txt
-            pip install gunicorn
-
-            # --- Write wsgi.py via heredoc (YAML-indented), then sanitize & DE-DENT ---
-            WSGI_TMP="$(mktemp)"
-            cat > "$WSGI_TMP" <<'PYEOF'
-            import importlib
-
-            candidates = [
-                ("app", "app"), ("app", "application"),
-                ("wsgi", "app"), ("wsgi", "application"),
-                ("server", "app"), ("server", "application"),
-                ("main", "app"), ("main", "application"),
-            ]
-
-            application = None
-
-            # Try common module:attribute pairs
-            for mod, attr in candidates:
-                try:
-                    m = importlib.import_module(mod)
-                    if hasattr(m, attr):
-                        application = getattr(m, attr)
-                        break
-                except Exception:
-                    continue
-
-            # Try app factory pattern
-            if application is None:
-                for mod in ["app", "server", "main", "wsgi"]:
-                    try:
-                        m = importlib.import_module(mod)
-                        if hasattr(m, "create_app"):
-                            application = m.create_app()
-                            break
-                    except Exception:
-                        continue
-
-            if application is None:
-                raise RuntimeError(
-                    "Could not locate Flask app. "
-                    "Define 'app' or 'application' in app.py/server.py/main.py, "
-                    "or provide a create_app()"
-                )
-            PYEOF
-
-            # Strip any injected DRONE_* lines and leading blanks
-            awk 'BEGIN{seen=0} !/^DRONE_/ { if(!seen){ if($0 ~ /^[[:space:]]*$/){ next } else { seen=1 } } print }' "$WSGI_TMP" > "$WSGI_TMP.clean"
-
-            # DE-DENT to remove YAML indentation — write helper file, then run it (avoid stdin injection)
-            DEDENTER="/tmp/dedent_wsgi.py"
-            cat > "$DEDENTER" <<'PY'
-            import sys, pathlib, textwrap
-            src_path = pathlib.Path(sys.argv[1])
-            dst_path = pathlib.Path("wsgi.py")
-            src = src_path.read_text(encoding="utf-8")
-            dst_path.write_text(textwrap.dedent(src).lstrip(), encoding="utf-8")
-            PY
-            python3 "$DEDENTER" "$WSGI_TMP.clean"
-            rm -f "$DEDENTER"
-
-            chmod 0644 wsgi.py
-            rm -f "$WSGI_TMP" "$WSGI_TMP.clean"
-
-            # -------------------------
-            # systemd service (sanitize then install)
-            # -------------------------
-            SERVICE_FILE_TMP="$(mktemp)"
-            cat > "$SERVICE_FILE_TMP" <<'EOF'
-            [Unit]
-            Description=NAIC Flask app (gunicorn)
-            After=network-online.target
-            Wants=network-online.target
-
-            [Service]
-            User=root
-            Group=root
-            WorkingDirectory=/opt/naic/app
-            Environment=PYTHONUNBUFFERED=1
-            Environment=PYTHONPATH=/opt/naic/app
-            Environment=PATH=/opt/naic/app/.venv/bin
-            ExecStart=/opt/naic/app/.venv/bin/gunicorn \
-              --workers 3 \
-              --worker-class gthread \
-              --threads 8 \
-              --bind 127.0.0.1:8000 \
-              --timeout 120 \
-              --graceful-timeout 30 \
-              --access-logfile - \
-              --error-logfile - \
-              wsgi:application
-            Restart=always
-            RestartSec=3
-
-            [Install]
-            WantedBy=multi-user.target
-            EOF
-
-            awk 'BEGIN{seen=0} !/^DRONE_/ { if(!seen){ if($0 ~ /^[[:space:]]*$/){ next } else { seen=1 } } print }' "$SERVICE_FILE_TMP" > "${SERVICE_FILE_TMP}.clean"
-            install -m 0644 "${SERVICE_FILE_TMP}.clean" /etc/systemd/system/naic.service
-            rm -f "$SERVICE_FILE_TMP" "${SERVICE_FILE_TMP}.clean"
-
-            systemctl daemon-reload
-            systemctl enable naic
-            systemctl restart naic
-
-            # Quick backend checks
-            sleep 2
-            echo "== systemctl status naic =="; systemctl --no-pager --full status naic || true
-            echo "== journal (tail) ==";        journalctl -u naic --no-pager -n 120 || true
-            echo "== listening on 8000? ==";    ss -lntp | grep ':8000' || true
-
-            # -------------------------
-            # Nginx site (HTTP first) – sanitize and install
-            # -------------------------
-            NGINX_SITE_TMP="$(mktemp)"
-            cat > "$NGINX_SITE_TMP" <<'EOF'
-            server {
-                listen 80 default_server;
-                server_name _;
-
-                access_log /var/log/nginx/naic_access.log;
-                error_log  /var/log/nginx/naic_error.log;
-
-                location / {
-                    proxy_pass         http://127.0.0.1:8000;
-                    proxy_set_header   Host $host;
-                    proxy_set_header   X-Real-IP $remote_addr;
-                    proxy_set_header   X-Forwarded-For $proxy_add_x_forwarded_for;
-                    proxy_set_header   X-Forwarded-Proto $scheme;
-                }
-            }
-            EOF
-
-            awk 'BEGIN{seen=0} !/^DRONE_/ { if(!seen){ if($0 ~ /^[[:space:]]*$/){ next } else { seen=1 } } print }' "$NGINX_SITE_TMP" > "${NGINX_SITE_TMP}.clean"
-            NGINX_SITE="/etc/nginx/sites-available/naic"
-            install -m 0644 "${NGINX_SITE_TMP}.clean" "$NGINX_SITE"
-            rm -f "$NGINX_SITE_TMP" "${NGINX_SITE_TMP}.clean"
-
-            # ensure only our site is enabled and is the default
-            rm -f /etc/nginx/sites-enabled/default || true
-            rm -f /etc/nginx/sites-enabled/naic || true
-            ln -s "$NGINX_SITE" /etc/nginx/sites-enabled/naic
-
-            nginx -t
-            systemctl reload nginx
-
-            # HTTPS (optional)
-            if [ "$SERVER_NAME" != "_" ] && [ "$SERVER_NAME" != "localhost" ] && [ -n "$SERVER_NAME" ]; then
-              sed -i "s/server_name _;/server_name ${SERVER_NAME};/" "$NGINX_SITE"
-              nginx -t && systemctl reload nginx
-              certbot --nginx -d "$SERVER_NAME" --non-interactive --agree-tos -m "$LETSENCRYPT_EMAIL" --redirect || true
-              nginx -t && systemctl reload nginx
+            # Make app directories and place current release
+            sudo mkdir -p "$APP_DIR/releases" "$APP_DIR/current"
+            sudo chown -R "$USER":"$USER" "$APP_DIR"
+            ts=$(date +%Y%m%d%H%M%S)
+            if [ -d "$APP_DIR/current" ] && [ "$(ls -A $APP_DIR/current || true)" ]; then
+              mv "$APP_DIR/current" "$APP_DIR/releases/$ts" || true
+              mkdir -p "$APP_DIR/current"
             fi
 
-            # Final checks
-            echo "== final status =="; systemctl --no-pager --full status naic || true
-            echo "== curl backend =="; curl -sS -D - -o /dev/null http://127.0.0.1:8000/ || true
-            echo "== nginx test ==";   nginx -t || true
+            tar -xzf "$RELEASE" -C "$APP_DIR/current"
+            rm -f "$RELEASE"
+            cd "$APP_DIR/current"
+
+            # ---------- Python app (Flask/Django/FastAPI) ----------
+            if [ -f requirements.txt ]; then
+              echo "[deploy] Detected Python app"
+              # Ensure Python and venv
+              sudo apt-get update -y
+              sudo apt-get install -y python3-venv python3-pip
+              python3 -m venv .venv || true
+              . .venv/bin/activate
+              pip install --upgrade pip wheel
+              pip install -r requirements.txt
+            fi
+
+            # ---------- Node app (Express/Next/Vite/React) ----------
+            if [ -f package.json ]; then
+              echo "[deploy] Detected Node app"
+              if ! command -v node >/dev/null 2>&1; then
+                curl -fsSL https://deb.nodesource.com/setup_20.x | sudo -E bash -
+                sudo apt-get install -y nodejs
+              fi
+              npm ci || npm install
+              # Build if build script exists
+              if command -v jq >/dev/null 2>&1; then
+                :
+              else
+                sudo apt-get install -y jq
+              fi
+              if jq -er '.scripts.build' package.json >/dev/null 2>&1; then
+                npm run build || true
+              fi
+            fi
+
+            # ---------- Docker (compose) path ----------
+            if [ -f docker-compose.yml ] || [ -f compose.yml ]; then
+              echo "[deploy] Detected docker compose"
+              if ! command -v docker >/dev/null 2>&1; then
+                curl -fsSL https://get.docker.com | sh
+                sudo usermod -aG docker "$USER"
+              fi
+              if docker compose version >/dev/null 2>&1; then
+                DOCKER_COMPOSE="docker compose"
+              else
+                sudo apt-get install -y docker-compose || true
+                DOCKER_COMPOSE="docker-compose"
+              fi
+              $DOCKER_COMPOSE pull || true
+              $DOCKER_COMPOSE up -d --build
+            fi
+
+            # ---------- Process restarts (best-effort) ----------
+            # If a systemd service exists, restart it.
+            if [ -n "${SERVICE_NAME:-}" ]; then
+              echo "[deploy] Restarting systemd service: $SERVICE_NAME"
+              sudo systemctl restart "$SERVICE_NAME" || true
+            elif systemctl list-units --type=service | grep -qE '(gunicorn|uvicorn|app\.service)'; then
+              # Try common names
+              for svc in gunicorn uvicorn app; do
+                sudo systemctl restart "$svc" 2>/dev/null || true
+              done
+            fi
+
+            # PM2 if ecosystem file exists
+            if [ -f ecosystem.config.js ] || [ -f ecosystem.config.cjs ] || [ -f ecosystem.config.mjs ]; then
+              if ! command -v pm2 >/dev/null 2>&1; then
+                sudo npm i -g pm2
+              fi
+              pm2 start ecosystem.config.* --update-env || true
+              pm2 save || true
+            fi
+
+            echo "[deploy] Done. Current code is at $APP_DIR/current"
