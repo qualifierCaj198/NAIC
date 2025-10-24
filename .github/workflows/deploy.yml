@@ -75,8 +75,9 @@ jobs:
             pip install -r requirements.txt
             pip install gunicorn
 
-            # --- Portable wsgi.py (auto-discovers your Flask app) ---
-            cat > wsgi.py <<'PYEOF'
+            # --- Write wsgi.py to temp, sanitize DRONE_* lines, then DE-DENT and save ---
+            WSGI_TMP="$(mktemp)"
+            cat > "$WSGI_TMP" <<'PYRAW'
             import importlib
 
             candidates = [
@@ -115,15 +116,22 @@ jobs:
                     "Define 'app' or 'application' in app.py/server.py/main.py, "
                     "or provide a create_app()"
                 )
-            PYEOF
+            PYRAW
 
-            # Sanitize wsgi.py (remove any injected DRONE_* line + leading blanks)
-            awk 'BEGIN{seen=0} !/^DRONE_/ { if(!seen){ if($0 ~ /^[[:space:]]*$/){ next } else { seen=1 } } print }' wsgi.py > wsgi.py.clean
-            mv wsgi.py.clean wsgi.py
+            # Remove any injected DRONE_* lines and leading blanks from the temp content,
+            # then de-dent the remaining Python so top-level starts at column 0.
+            awk 'BEGIN{seen=0} !/^DRONE_/ { if(!seen){ if($0 ~ /^[[:space:]]*$/){ next } else { seen=1 } } print }' "$WSGI_TMP" > "${WSGI_TMP}.clean" || true
+            python3 - "$WSGI_TMP.clean" <<'PY'
+            import sys, pathlib
+            from textwrap import dedent
+            src = pathlib.Path(sys.argv[1]).read_text(encoding="utf-8")
+            pathlib.Path("wsgi.py").write_text(dedent(src).lstrip(), encoding="utf-8")
+            PY
             chmod 0644 wsgi.py
+            rm -f "$WSGI_TMP" "${WSGI_TMP}.clean"
 
             # -------------------------
-            # systemd service
+            # systemd service (sanitize then install)
             # -------------------------
             SERVICE_FILE_TMP="$(mktemp)"
             cat > "$SERVICE_FILE_TMP" <<'EOF'
@@ -166,12 +174,12 @@ jobs:
 
             # Quick backend checks
             sleep 2
-            systemctl --no-pager --full status naic || true
-            journalctl -u naic --no-pager -n 100 || true
-            ss -lntp | grep ':8000' || true
+            echo "== systemctl status naic =="; systemctl --no-pager --full status naic || true
+            echo "== journal (tail) ==";        journalctl -u naic --no-pager -n 120 || true
+            echo "== listening on 8000? ==";    ss -lntp | grep ':8000' || true
 
             # -------------------------
-            # Nginx site (HTTP first)
+            # Nginx site (HTTP first) – sanitize and install
             # -------------------------
             NGINX_SITE_TMP="$(mktemp)"
             cat > "$NGINX_SITE_TMP" <<'EOF'
@@ -197,6 +205,7 @@ jobs:
             install -m 0644 "${NGINX_SITE_TMP}.clean" "$NGINX_SITE"
             rm -f "$NGINX_SITE_TMP" "${NGINX_SITE_TMP}.clean"
 
+            # ensure only our site is enabled and is the default
             rm -f /etc/nginx/sites-enabled/default || true
             rm -f /etc/nginx/sites-enabled/naic || true
             ln -s "$NGINX_SITE" /etc/nginx/sites-enabled/naic
@@ -213,6 +222,6 @@ jobs:
             fi
 
             # Final checks
-            systemctl --no-pager --full status naic || true
-            curl -sS -D - -o /dev/null http://127.0.0.1:8000/ || true
-            nginx -t || true
+            echo "== final status =="; systemctl --no-pager --full status naic || true
+            echo "== curl backend =="; curl -sS -D - -o /dev/null http://127.0.0.1:8000/ || true
+            echo "== nginx test ==";   nginx -t || true
